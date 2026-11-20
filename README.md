@@ -1,41 +1,30 @@
-[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/glsalierno/pubchem-toxinfo-cas-retriever/blob/main/LICENSE)
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/downloads/)
-[![MATLAB](https://img.shields.io/badge/MATLAB-R2014b%2B-orange.svg)](https://www.mathworks.com/products/matlab.html)
 
 # PubChem Toxicological Info Retriever by CAS
 
 Asynchronous Python script to retrieve toxicological information, IUPAC names, SMILES, synonyms, names, and literature references from PubChem for CAS numbers using PUG REST API. Exports to JSON/Excel.
 
 ## Key Features
-- Asynchronous fetching for efficient batch processing.
+- Asynchronous client with one paced request stream per batch.
 - Extracts tox data, IUPAC/SMILES, synonyms, and literature refs.
 - Handles retries for API errors; exports to formatted JSON and Excel.
 - Interactive or command-line input.
 
 ## Requirements
 - Python 3.x
-- Install dependencies: `pip install aiohttp openpyxl`
+- Install dependencies: `python -m pip install -r requirements.txt`
 
 ## Usage
 Run with CAS numbers for batch processing:
 
-> > python get_toxinfo_by_cas6.py 50-00-0 64-17-5
+```bash
+python get_toxinfo_by_cas6.py --log-level INFO 67-56-1 64-17-5
+```
 
->Fetching data for 2 CAS numbers...
-
->Processing CAS 50-00-0
-
->Processing CAS 64-17-5
-
->Found CID 712 for CAS 50-00-0
-
->Found CID 702 for CAS 64-17-5
-
->Data for 2 compounds saved to tox_data.json
-
->Data exported to Excel file: tox_data.xlsx
-
->Please check the JSON and Excel files for the retrieved data.
+This writes `tox_data.json` and `tox_data.xlsx` to the current directory,
+including error records when a lookup fails. PubChem matches and annotations
+are research leads, not independent CAS validation or hazard classifications.
 
 Or run without arguments for interactive mode (enter CAS one per line, blank to finish).
 
@@ -43,7 +32,7 @@ Or run without arguments for interactive mode (enter CAS one per line, blank to 
 The MATLAB wrapper calls the Python script and parses the JSON output into a table:
 
 ```matlab
->> toxTable = >> getToxInfo({'50-00-0', '64-17-5'});
+toxTable = getToxInfo({'50-00-0', '64-17-5'});
 Processed 2 compounds. Table has 2 rows.
 ```
 ## Files
@@ -51,11 +40,24 @@ Processed 2 compounds. Table has 2 rows.
 - getToxInfo.m: MATLAB wrapper function.
 
 ## Notes
-- Complies with PubChem API terms (add pauses for large batches).
-- Handles retries for transient errors.
+- Each HTTP attempt has a 30-second total timeout. Rate-limit responses are not treated as unmatched CAS numbers.
+- Diagnostics go to stderr; use `--log-level WARNING` for failures and throttling notices only.
 - For issues, open a GitHub issue.
 
 
 Author: glsalierno  
 Date: September 2025  
 GitHub: [glsalierno](https://github.com/glsalierno)
+
+## Offline tests
+
+```text
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The tests mock PubChem requests; CI does not call PubChem or exercise MATLAB.
+Network calls are paced in each process and retry HTTP 429 or 503 at most twice.
+The tool honors Retry-After. If PubChem requests a wait over 30 seconds, the
+tool does not retry early or issue a new request during that cooldown. Keep
+batch sizes modest and follow [PubChem's usage policy](https://pubchem.ncbi.nlm.nih.gov/docs/programmatic-access).
