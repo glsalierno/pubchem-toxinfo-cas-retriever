@@ -1,8 +1,12 @@
 import aiohttp
 import asyncio
 import json
-from typing import List, Dict, Any
-import sys
+from typing import List, Dict, Any, Optional
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import logging
 from urllib.parse import quote
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
@@ -11,57 +15,109 @@ from openpyxl.styles import Font
 BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 VIEW_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view"
 
-async def fetch_url(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict[str, Any]:
-    for attempt in range(retries):
-        try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    try:
-                        # Try to decode as UTF-8 first
-                        text = await response.text()
-                        return json.loads(text)
-                    except UnicodeDecodeError:
-                        # If UTF-8 decoding fails, use a more permissive encoding
-                        content = await response.read()
-                        text = content.decode('iso-8859-1', errors='ignore')
-                        return json.loads(text)
-                elif response.status == 503:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    print(f"Error {response.status} for URL: {url}")
-                    return {'error': f"HTTP error {response.status}"}
-        except Exception as e:
-            print(f"Exception for URL {url}: {str(e)}")
-            if attempt == retries - 1:
-                return {'error': str(e)}
-            await asyncio.sleep(2 ** attempt)
+LOG = logging.getLogger(__name__)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+TRANSIENT_STATUS = {429, 503}
+MAX_RETRY_AFTER_SECONDS = 30
 
-async def get_pubchem_cid(session: aiohttp.ClientSession, cas_number: str) -> int:
-    url = f"{BASE_URL}/compound/name/{quote(cas_number)}/cids/JSON"
-    data = await fetch_url(session, url)
-    if 'IdentifierList' in data and 'CID' in data['IdentifierList']:
-        return data['IdentifierList']['CID'][0]
-    print(f"Failed to get CID for CAS {cas_number}. Response: {data}")
+
+def retry_after_seconds(header, default):
+    if header:
+        try:
+            return max(0, int(header))
+        except ValueError:
+            try:
+                deadline = parsedate_to_datetime(header)
+            except (ValueError, TypeError, OverflowError):
+                return default
+            if deadline.tzinfo is not None:
+                return max(0, (deadline - datetime.now(timezone.utc)).total_seconds())
+    return default
+
+
+@dataclass
+class PubChemPace:
+    blocked_until: float = 0.0
+
+
+async def fetch_url(session: aiohttp.ClientSession, url: str, retries: int = 3,
+                    *, pacing: Optional[PubChemPace] = None) -> Dict[str, Any]:
+    pacing = pacing if pacing is not None else PubChemPace()
+    loop = asyncio.get_running_loop()
+    if retries < 1:
+        raise ValueError("retries is the maximum number of attempts and must be positive")
+    for attempt in range(1, retries + 1):
+        remaining = pacing.blocked_until - loop.time()
+        if remaining > MAX_RETRY_AFTER_SECONDS:
+            return {'error': 'PubChem cooldown active; no request was sent'}
+        await asyncio.sleep(max(0.25, remaining))
+        try:
+            async with session.get(url, timeout=HTTP_TIMEOUT) as response:
+                status = response.status
+                if status == 200:
+                    try:
+                        payload = json.loads(await response.text())
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        LOG.error("Invalid PubChem JSON for %s: %s", url, e)
+                        return {'error': 'Invalid PubChem JSON response'}
+                    if not isinstance(payload, dict):
+                        LOG.error("Unexpected PubChem JSON type for %s", url)
+                        return {'error': 'Unexpected PubChem JSON response'}
+                    return payload
+                if status not in TRANSIENT_STATUS:
+                    LOG.warning("PubChem HTTP %s for %s", status, url)
+                    return {'error': f'HTTP error {status}'}
+                delay = max(2 ** (attempt - 1),
+                            retry_after_seconds(response.headers.get('Retry-After'), 0))
+                pacing.blocked_until = loop.time() + delay
+        except asyncio.TimeoutError:
+            LOG.error("PubChem request timed out for %s", url)
+            return {'error': 'PubChem request timed out'}
+        except aiohttp.ClientError as e:
+            LOG.error("PubChem request failed for %s: %s", url, e)
+            return {'error': f'PubChem request failed: {e}'}
+
+        if attempt == retries or delay > MAX_RETRY_AFTER_SECONDS:
+            LOG.warning("PubChem HTTP %s for %s; stopped after %d/%d attempts (cooldown %.1fs)",
+                        status, url, attempt, retries, delay)
+            return {'error': f'HTTP error {status}'}
+        LOG.warning("PubChem HTTP %s for %s after attempt %d/%d; retrying in %.1fs",
+                    status, url, attempt, retries, delay)
+    raise AssertionError("Unreachable retry loop")
+
+
+class PubChemLookupError(RuntimeError):
+    pass
+
+
+async def get_pubchem_cid(session: aiohttp.ClientSession, cas_number: str, *, pacing=None) -> Optional[int]:
+    url = f"{BASE_URL}/compound/name/{quote(cas_number, safe='')}/cids/JSON"
+    data = await fetch_url(session, url, pacing=pacing)
+    cids = data.get('IdentifierList', {}).get('CID', [])
+    if cids:
+        return cids[0]
+    if 'error' in data and data['error'] != 'HTTP error 404':
+        raise PubChemLookupError(data['error'])
+    LOG.warning("No CID returned for CAS %s", cas_number)
     return None
 
-async def get_compound_data(session: aiohttp.ClientSession, cid: int) -> Dict[str, Any]:
+async def get_compound_data(session: aiohttp.ClientSession, cid: int, *, pacing=None) -> Dict[str, Any]:
     url = f"{VIEW_URL}/data/compound/{cid}/JSON"
-    return await fetch_url(session, url)
+    return await fetch_url(session, url, pacing=pacing)
 
-async def get_iupac_and_smiles(session: aiohttp.ClientSession, cid: int) -> Dict[str, str]:
-    url = f"{BASE_URL}/compound/cid/{cid}/property/IUPACName,CanonicalSMILES/JSON"
-    data = await fetch_url(session, url)
-    if 'PropertyTable' in data and 'Properties' in data['PropertyTable']:
-        properties = data['PropertyTable']['Properties'][0]
+async def get_iupac_and_smiles(session: aiohttp.ClientSession, cid: int, *, pacing=None) -> Dict[str, str]:
+    url = f"{BASE_URL}/compound/cid/{cid}/property/IUPACName,ConnectivitySMILES/JSON"
+    data = await fetch_url(session, url, pacing=pacing)
+    rows = data.get('PropertyTable', {}).get('Properties', [])
+    if rows:
+        properties = rows[0]
         return {
             'IUPAC': properties.get('IUPACName', 'N/A'),
-            'SMILES': properties.get('CanonicalSMILES', 'N/A')
+            'SMILES': properties.get('ConnectivitySMILES') or properties.get('CanonicalSMILES', 'N/A')
         }
     return {'IUPAC': 'N/A', 'SMILES': 'N/A'}
 
-async def get_names_and_synonyms(session: aiohttp.ClientSession, cid: int) -> Dict[str, Any]:
-    url = f"{VIEW_URL}/data/compound/{cid}/JSON"
-    data = await fetch_url(session, url)
+def get_names_and_synonyms(data: Dict[str, Any]) -> Dict[str, Any]:
     names_and_synonyms = {'Names': [], 'Synonyms': []}
     if 'Record' in data and 'Section' in data['Record']:
         for section in data['Record']['Section']:
@@ -78,9 +134,7 @@ async def get_names_and_synonyms(session: aiohttp.ClientSession, cid: int) -> Di
                 break
     return names_and_synonyms
 
-async def get_literature_references(session: aiohttp.ClientSession, cid: int) -> Dict[str, List[str]]:
-    url = f"{VIEW_URL}/data/compound/{cid}/JSON"
-    data = await fetch_url(session, url)
+def get_literature_references(data: Dict[str, Any]) -> Dict[str, List[str]]:
     references = {
         'Disease and References': [],
         'Nature Journal References': [],
@@ -119,21 +173,21 @@ def extract_tox_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
     return tox_data
 
-async def process_cas_number(session: aiohttp.ClientSession, cas_number: str) -> Dict[str, Any]:
-    print(f"Processing CAS {cas_number}")
+async def process_cas_number(session: aiohttp.ClientSession, cas_number: str, *, pacing=None) -> Dict[str, Any]:
+    LOG.info("Processing CAS %s", cas_number)
     try:
-        cid = await get_pubchem_cid(session, cas_number)
+        cid = await get_pubchem_cid(session, cas_number, pacing=pacing)
         if cid is None:
             return {'CAS': cas_number, 'error': 'Could not find PubChem CID'}
         
-        print(f"Found CID {cid} for CAS {cas_number}")
-        compound_data = await get_compound_data(session, cid)
+        LOG.info("Found CID %s for CAS %s", cid, cas_number)
+        compound_data = await get_compound_data(session, cid, pacing=pacing)
         if 'error' in compound_data:
             return {'CAS': cas_number, 'PubChemCID': cid, 'error': compound_data['error']}
         
-        iupac_smiles = await get_iupac_and_smiles(session, cid)
-        names_and_synonyms = await get_names_and_synonyms(session, cid)
-        literature_references = await get_literature_references(session, cid)
+        iupac_smiles = await get_iupac_and_smiles(session, cid, pacing=pacing)
+        names_and_synonyms = get_names_and_synonyms(compound_data)
+        literature_references = get_literature_references(compound_data)
         
         if 'Record' not in compound_data:
             return {
@@ -158,14 +212,18 @@ async def process_cas_number(session: aiohttp.ClientSession, cas_number: str) ->
             'LiteratureReferences': literature_references,
             'ToxData': tox_data
         }
-    except Exception as e:
-        print(f"Error processing CAS {cas_number}: {str(e)}")
-        return {'CAS': cas_number, 'error': f"Processing error: {str(e)}"}
+    except PubChemLookupError as e:
+        LOG.warning("CAS %s: CID lookup failed: %s", cas_number, e)
+        return {'CAS': cas_number, 'error': str(e)}
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as e:
+        LOG.error("CAS %s: unexpected PubChem data: %s", cas_number, e)
+        return {'CAS': cas_number, 'error': f"Unexpected PubChem data: {e}"}
 
 async def get_tox_data_for_cas_numbers(cas_numbers: List[str]) -> List[Dict[str, Any]]:
-    async with aiohttp.ClientSession() as session:
-        tasks = [process_cas_number(session, cas) for cas in cas_numbers]
-        return await asyncio.gather(*tasks)
+    # Use one paced request stream, so Retry-After applies to the whole batch.
+    pacing = PubChemPace()
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        return [await process_cas_number(session, cas, pacing=pacing) for cas in cas_numbers]
 
 def save_to_json(data: List[Dict[str, Any]], filename: str):
     with open(filename, 'w') as f:
@@ -230,11 +288,8 @@ def save_to_excel(data: List[Dict[str, Any]], filename: str):
             max_length = 0
             column_letter = get_column_letter(column[0].column)
             for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(cell.value)
-                except:
-                    pass
+                if cell.value is not None:
+                    max_length = max(max_length, len(str(cell.value)))
             adjusted_width = min(max_length + 2, 100)
             ws.column_dimensions[column_letter].width = adjusted_width
 
@@ -245,22 +300,29 @@ def get_cas_numbers_from_user() -> List[str]:
     print("Enter CAS numbers (one per line). Press Enter twice to finish:")
     cas_numbers = []
     while True:
-        cas = input().strip()
+        try:
+            cas = input().strip()
+        except EOFError:
+            break
         if cas:
             cas_numbers.append(cas)
         else:
             break
     return cas_numbers
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        cas_numbers = sys.argv[1:]
-    else:
-        cas_numbers = get_cas_numbers_from_user()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Retrieve PubChem toxicology annotations by CAS number.")
+    parser.add_argument("cas", nargs="*", metavar="CAS", help="CAS numbers; omit to enter interactively")
+    parser.add_argument("--log-level", default="INFO", type=str.upper,
+                        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+                        help="stderr diagnostic verbosity (default: INFO)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(levelname)s: %(message)s")
+    cas_numbers = args.cas or get_cas_numbers_from_user()
 
     if not cas_numbers:
         print("No CAS numbers provided. Exiting.")
-        sys.exit(1)
+        return 1
 
     print(f"Fetching data for {len(cas_numbers)} CAS numbers...")
     results = asyncio.run(get_tox_data_for_cas_numbers(cas_numbers))
@@ -273,3 +335,9 @@ if __name__ == "__main__":
     save_to_excel(results, excel_filename)
 
     print("Please check the JSON and Excel files for the retrieved data.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
